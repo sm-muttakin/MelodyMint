@@ -1,0 +1,302 @@
+================================================================================
+MELODYMINT — PROJECT GUIDE  (v3 — raw SQL + real PL/pgSQL)
+================================================================================
+Read this like a story, from the top. If a word confuses you, keep reading
+— it usually gets explained a sentence later. Every function anywhere in
+this project has a one-line "# comment" directly above it in the actual
+code too, so you can always find this same plain explanation sitting right
+next to the real thing.
+
+WHAT CHANGED SINCE LAST TIME: some of the "smart" logic (counting votes,
+paying artists for listens, moving tokens between wallets) used to live in
+Python. Now it lives INSIDE the database itself, written in a language
+called PL/pgSQL — which is PostgreSQL's version of Oracle's PL/SQL from
+your course description. Python just asks the database to do the work and
+reads back the result.
+
+
+################################################################################
+PART 0: THE BIG PICTURE — WHERE DOES EACH TYPE OF "SMART" LOGIC LIVE?
+################################################################################
+Think of the whole project as having 4 layers, like a sandwich:
+
+  1. FRONTEND (React)      — buttons, forms, what you actually see and click
+  2. ROUTERS (FastAPI)      — "traffic cops": read the request, check who
+                              you are, call the right database code, send
+                              back JSON
+  3. PL/pgSQL (inside the    — "the rules": counting votes, paying tokens,
+     database itself)          checking balances — written in real SQL
+                              code that lives permanently in the database
+  4. TABLES (Postgres)       — where everything is actually stored
+
+Simple stuff (like "give me the list of all songs") skips layer 3 — it's
+just a plain SELECT straight from layer 2. Complicated stuff that MUST
+always be correct no matter who calls it (like "never let someone spend
+tokens they don't have") lives in layer 3, so it's enforced by the
+database itself, not just by whichever Python function happens to remember
+to check.
+
+
+################################################################################
+PART 1: BACKEND  (folder: melodymint_backend/)
+################################################################################
+
+--------------------------------------------------------------------------------
+schema.sql  — THE MOST IMPORTANT FILE FOR THIS ROUND OF CHANGES
+--------------------------------------------------------------------------------
+This file has two halves now.
+
+HALF A — the tables (same as before): plain CREATE TABLE statements with
+PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, and ON DELETE rules written out by
+hand.
+
+HALF B — the PL/pgSQL functions, triggers, and procedure (NEW):
+
+  FUNCTION fn_sync_song_tag_votes()  +  TRIGGER trg_tag_vote_after_insert
+    Plain words: "every single time a new row gets added to tag_vote
+    (meaning: someone just clicked upvote or downvote), automatically run
+    this block of code." The code re-counts ALL the votes for that tag
+    from scratch, saves the new upvotes/downvotes numbers onto the
+    song_tag row, decides if the tag should flip to 'removed' (too many
+    downvotes), and — if the tag JUST reached +5 net upvotes — pays 10
+    tokens to whoever suggested it. Nobody has to remember to call this;
+    the database does it by itself, guaranteed, every time.
+
+  FUNCTION fn_credit_listening_earnings()  +  TRIGGER trg_listening_history_after_insert
+    Same idea: every time a new row gets added to listening_history
+    (someone just listened to N more seconds of a song), this
+    automatically adds up ALL the listening time that song has ever had,
+    and if the total just crossed a new 300-second (5 minute) mark, pays
+    1 token to whoever owns/uploaded that song.
+
+  FUNCTION fn_transfer_tokens(...)  — THIS IS THE "PROCEDURE"
+    Plain words: this is one callable block of PL/pgSQL that safely moves
+    tokens from one wallet to another. It:
+      1. Makes sure the amount is a positive number (otherwise: error).
+      2. "Locks" the wallet rows it's about to change (FOR UPDATE) so if
+         two transfers happen at the EXACT same instant, they can't both
+         read the same starting balance and cause tokens to appear or
+         vanish out of nowhere.
+      3. For gift/spend: checks the sender actually has enough tokens
+         (otherwise: error).
+      4. Actually moves the tokens (two UPDATE statements).
+      5. Writes a permanent record into the transaction table.
+      6. Hands back that new transaction row.
+    Python calls this with one line: `SELECT * FROM fn_transfer_tokens(...)`
+    — all the safety logic above happens INSIDE the database, atomically.
+
+A trigger and a procedure are both just PL/pgSQL code — the difference is
+HOW they run: a trigger runs automatically because of an event (an INSERT
+happened), a procedure/function runs because someone explicitly calls it
+by name.
+
+
+--------------------------------------------------------------------------------
+app/db.py
+--------------------------------------------------------------------------------
+- get_conn() — # borrows a database connection from a small reusable pool, and cleans up automatically when done
+- fetch_one() — # run a SELECT that returns one row (or nothing)
+- fetch_all() — # run a SELECT that returns many rows
+- execute() — # run an INSERT/UPDATE/DELETE, optionally handing back the new row
+
+
+--------------------------------------------------------------------------------
+app/auth.py
+--------------------------------------------------------------------------------
+- hash_password() — # scrambles a password into something unreadable, with a random ingredient per user (a "salt") so two people with the same password get totally different scrambled results
+- verify_password() — # checks a freshly typed password against the scrambled version
+- create_access_token() — # makes a signed login "ticket" (JWT) after a successful login
+- get_current_user() — # reads someone's ticket and looks up who they are, fresh, every request
+- require_admin() — # like get_current_user, but also demands role == 'admin'
+- require_artist_or_admin() — # like get_current_user, but also demands role == 'artist' or 'admin' — this is what blocks listeners from uploading songs
+
+
+--------------------------------------------------------------------------------
+app/services/token_service.py  (now much shorter — the database does the hard part)
+--------------------------------------------------------------------------------
+- get_wallet_balance() — # look up one number: how many tokens someone has
+- transfer_tokens() — # calls fn_transfer_tokens in the database, and turns its errors into clean 400/404 responses
+- cast_tag_vote() — # records one vote; the DB trigger does all the recounting automatically right after
+- log_listening_and_credit_owner() — # records one listen; the DB trigger pays the song owner automatically right after
+
+
+--------------------------------------------------------------------------------
+app/routers/  — every function now has a short comment directly above it in
+the code. Here's the same list in one place for convenience:
+--------------------------------------------------------------------------------
+
+auth.py
+  register            — someone types a new username/email/password -> we make them an account, a wallet, and playback settings
+  login               — someone types username+password -> if correct, hand them a login ticket (JWT)
+  me                  — whoever's ticket this is, tell the frontend who they are
+
+users.py
+  list_users          — give back every user that isn't banned
+  get_user            — look up one user by their id number
+  get_wallet          — show someone's token balance, but only if it's YOUR wallet (or you're admin)
+
+transactions.py
+  create_transaction  — buy/gift/spend/earn tokens — sender/receiver always come from your login, never the request body
+
+songs.py
+  _song_to_out        — (helper) turn a raw database song row into the JSON shape the frontend expects
+  _detect_duration_sec — (helper) figure out how many seconds long an uploaded audio file is
+  create_song         — make a song row with no real audio file — artists/admins only
+  upload_song         — save a real audio file, auto-detect its length, make the song row — artists/admins only
+  search_songs        — SIMPLE query: title or artist name contains what you typed
+  get_song            — look up one song by id
+  list_songs          — give back every song
+
+tags.py
+  create_tag          — make a brand new tag if it doesn't already exist
+  list_tags           — give back every tag
+  suggest_song_tag    — someone suggests a tag for a song — starts live, votes decide if it sticks
+  get_song_tags       — show the active tags on one song
+  search_songs_by_tag — the "search by mood" feature — every song with this tag
+  vote_on_song_tag    — upvote or downvote a tag suggestion
+  recommend_for_me    — SIMPLE-ish query: guess what you'd like based on tags of songs you've heard
+  trending_tags       — ADVANCED query (window function RANK()) — top 10 tags by total upvotes
+
+playlists.py
+  _own_playlist_or_404 — (helper) make sure this playlist exists AND is yours before touching it
+  create_playlist     — make a new empty playlist
+  get_playlist        — look up one playlist by id
+  get_user_playlists  — every playlist a specific user owns
+  add_song_to_playlist — add a song into YOUR playlist
+  get_playlist_songs  — SIMPLE JOIN query: songs in a playlist, in order
+  remove_song_from_playlist — remove a song from YOUR playlist
+
+listening.py
+  log_listening       — record a listen — the DB trigger pays the owner automatically
+
+playback.py
+  get_my_playback_settings    — get YOUR OWN volume/shuffle/loop
+  update_my_playback_settings — change YOUR OWN volume/shuffle/loop
+
+admin.py  (every single function here requires you to be an admin)
+  list_all_users           — list every user, banned ones included
+  update_user              — change someone's role, or ban/unban them
+  list_song_tags_for_review — list flagged tag suggestions
+  moderate_song_tag        — manually flip a tag back to active, or remove it
+  delete_song              — delete a song entirely
+  top_artists              — ADVANCED query (CTE + subquery + window function) — ranks artists by listening time
+
+
+--------------------------------------------------------------------------------
+app/main.py
+--------------------------------------------------------------------------------
+Starts the app. On startup, reads schema.sql as plain text and runs it —
+this creates all the tables AND all the PL/pgSQL functions/triggers in one
+shot. Then turns on CORS (so the browser is allowed to call this backend
+from a different port — this is what fixes the "NetworkError" bug from
+before), mounts /media/ for audio files, and registers every router.
+
+
+################################################################################
+PART 2: THE TWO "ADVANCED QUERY" ENDPOINTS, EXPLAINED SLOWLY
+################################################################################
+
+1. GET /tags/trending  (medium — a window function)
+
+   SELECT t.tag_id, t.tag_name, t.tag_category,
+          COUNT(st.song_tag_id) AS song_count,
+          COALESCE(SUM(st.upvotes), 0) AS total_upvotes,
+          RANK() OVER (ORDER BY COALESCE(SUM(st.upvotes), 0) DESC) AS rank
+   FROM tag t
+   JOIN song_tag st ON st.tag_id = t.tag_id AND st.status = 'active'
+   GROUP BY t.tag_id, t.tag_name, t.tag_category
+   ORDER BY rank
+   LIMIT 10
+
+   In plain words: "Group all the song-tag rows by which tag they belong
+   to, so I get one row per tag with the total upvotes added up. THEN,
+   number those rows 1st, 2nd, 3rd... by that total — that numbering part
+   is what RANK() OVER (...) does. A normal GROUP BY can't number its own
+   rows like that; that's the whole reason window functions exist."
+
+2. GET /admin/analytics/top-artists  (harder — a CTE + a subquery + a window function)
+
+   WITH artist_stats AS (
+       SELECT u.user_id, u.username,
+              COUNT(DISTINCT s.song_id) AS song_count,
+              COALESCE(SUM(lh.listened_sec), 0) AS total_listened_sec,
+              COALESCE((SELECT SUM(t.amount) FROM transaction t
+                        WHERE t.to_user_id = u.user_id AND t.txn_type='earn'), 0)
+                AS tokens_earned
+       FROM user_account u
+       JOIN song s ON s.owner_id = u.user_id
+       LEFT JOIN listening_history lh ON lh.song_id = s.song_id
+       WHERE u.role = 'artist'
+       GROUP BY u.user_id, u.username
+   )
+   SELECT *, RANK() OVER (ORDER BY total_listened_sec DESC) AS rank
+   FROM artist_stats
+   ORDER BY rank
+
+   In plain words: "First, build a TEMPORARY table just for this one query
+   (that's the WITH ... AS part — it's called a CTE, short for 'Common
+   Table Expression'. Think of it as a sticky note with a mini-result on
+   it that only this query can see). Inside that sticky note, for every
+   artist: count their songs, add up all their listening seconds, and —
+   using a totally separate mini-query tucked inside (that's the
+   subquery) — add up how many tokens they've earned. THEN, once the
+   sticky note is built, rank the artists by listening time."
+
+Why bother with a CTE instead of just one giant query? Because "how many
+tokens has this artist earned" needs its own separate counting step (a
+subquery) that would be awkward to squeeze into the same GROUP BY as the
+song/listening counts. The CTE lets you build the report in clear stages
+instead of one unreadable mega-query.
+
+
+################################################################################
+PART 3: FRONTEND CHANGES THIS ROUND
+################################################################################
+- src/pages/DiscoverPage.jsx — added a "Trending tags right now" card that
+  calls GET /tags/trending and shows the top 10, with a button to jump
+  straight into browsing that tag.
+- src/pages/AdminPage.jsx — added a "Top artists" card that calls
+  GET /admin/analytics/top-artists.
+- src/pages/SongsPage.jsx — hides the upload form entirely for listener
+  accounts (the backend already refuses it with a 403; this just avoids
+  showing a form that would fail).
+- app/main.py — added CORS so the frontend can actually reach the backend
+  (fixes the earlier "NetworkError when attempting to fetch resource" bug).
+
+Everything else is unchanged from the previous version of this guide.
+
+
+################################################################################
+PART 4: HOW TO VERIFY EVERYTHING YOURSELF, STEP BY STEP
+################################################################################
+1. No ORM anywhere — grep for "SELECT", "INSERT", "UPDATE" in
+   app/routers/ and app/services/ — every single database call is a
+   plain SQL string. There's no models.py, no .query(), no ORM classes.
+
+2. Real triggers exist — run this in psql:
+     SELECT trigger_name, event_object_table FROM information_schema.triggers;
+   You should see trg_tag_vote_after_insert and
+   trg_listening_history_after_insert.
+
+3. Real procedure exists — run:  \df fn_*
+   You should see fn_transfer_tokens, fn_sync_song_tag_votes,
+   fn_credit_listening_earnings.
+
+4. The procedure actually protects balances — try to gift more tokens
+   than you have. You'll get a clean "Insufficient token balance" 400
+   error — that message comes from a RAISE EXCEPTION inside
+   fn_transfer_tokens, caught by Python and translated to a normal
+   HTTP error.
+
+5. The triggers actually fire without Python asking them to — vote on a
+   tag 5 times from 5 different accounts (net +5), and watch the
+   suggester's wallet balance go up by 10 automatically — nothing in the
+   /song-tags/vote endpoint explicitly does that; the database trigger
+   does it on its own the instant the 5th vote is inserted.
+
+6. The advanced queries return correctly ranked data — call
+   GET /tags/trending and GET /admin/analytics/top-artists and check the
+   "rank" numbers go up in order, with ties sharing the same rank
+   (that's exactly what RANK() is supposed to do, as opposed to
+   ROW_NUMBER() which would never tie).
+================================================================================
